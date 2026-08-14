@@ -57,11 +57,20 @@ export interface PredictionChartCanvasFrame {
   markerPulseStyle: 'filled' | 'ring'
   markerOffsetX: number
   markerPulseProgress: number
+  revealProgress: number
+  surge: {
+    color: string
+    progress: number
+  } | null
   cursor: {
     x: number
     values: Record<string, number>
     guideTop: number
     guideColor: string
+  } | null
+  cursorSplit: {
+    color: string
+    opacity: number
   } | null
 }
 
@@ -262,31 +271,80 @@ function drawSeries(context: CanvasRenderingContext2D, frame: PredictionChartCan
   const plotTop = frame.margin.top
   const plotWidth = Math.max(1, frame.width - frame.margin.left - frame.margin.right)
   const plotHeight = Math.max(1, frame.height - frame.margin.top - frame.margin.bottom)
+  const revealProgress = Math.max(0, Math.min(1, frame.revealProgress))
+
+  if (revealProgress <= 0) {
+    return
+  }
 
   context.save()
   context.beginPath()
-  context.rect(plotLeft - 4, plotTop - 4, plotWidth + 8, plotHeight + 8)
+  context.rect(plotLeft - 4, plotTop - 4, plotWidth * revealProgress + 8, plotHeight + 8)
   context.clip()
 
   frame.series.forEach((seriesItem) => {
     const color = resolveCssColor(context.canvas, seriesItem.color, '#1452f0')
     const segments = buildSeriesSegments(frame, seriesItem.key)
+    const splitX = frame.cursor && frame.cursorSplit ? frame.margin.left + frame.cursor.x : null
 
     segments.forEach((points) => {
-      drawArea(context, frame, points, color)
       if (points.length < 2) {
         return
       }
 
-      context.save()
-      context.beginPath()
-      traceSeriesPath(context, points, frame.lineCurve)
-      context.strokeStyle = color
-      context.lineWidth = frame.lineStrokeWidth
-      context.lineCap = 'round'
-      context.lineJoin = 'round'
-      context.stroke()
-      context.restore()
+      function drawStroke(
+        strokeColor: string | CanvasGradient,
+        strokeWidth: number,
+        opacity: number,
+        clipLeft: number,
+        clipWidth: number,
+      ) {
+        if (clipWidth <= 0) {
+          return
+        }
+
+        context.save()
+        context.beginPath()
+        context.rect(clipLeft, plotTop - 4, clipWidth, plotHeight + 8)
+        context.clip()
+        context.beginPath()
+        traceSeriesPath(context, points, frame.lineCurve)
+        context.strokeStyle = strokeColor
+        context.globalAlpha = opacity
+        context.lineWidth = strokeWidth
+        context.lineCap = 'round'
+        context.lineJoin = 'round'
+        context.stroke()
+        context.restore()
+      }
+
+      if (splitX != null && frame.cursorSplit) {
+        const clampedSplitX = Math.max(plotLeft, Math.min(plotLeft + plotWidth, splitX))
+        const mutedColor = resolveCssColor(context.canvas, frame.cursorSplit.color, '#99A6B5')
+        drawStroke(mutedColor, 1.4, frame.cursorSplit.opacity, clampedSplitX, plotLeft + plotWidth - clampedSplitX)
+        drawStroke(color, frame.lineStrokeWidth, 1, plotLeft - 4, clampedSplitX - plotLeft + 4)
+        return
+      }
+
+      drawArea(context, frame, points, color)
+      drawStroke(color, frame.lineStrokeWidth, 1, plotLeft - 4, plotWidth + 8)
+
+      if (frame.surge) {
+        const surgeProgress = Math.max(0, Math.min(1, frame.surge.progress))
+        const surgeCenter = plotLeft + plotWidth * surgeProgress
+        const surgeHalfWidth = Math.max(16, plotWidth * 0.07)
+        const surgeLeft = Math.max(plotLeft, surgeCenter - surgeHalfWidth)
+        const surgeRight = Math.min(plotLeft + plotWidth, surgeCenter + surgeHalfWidth)
+        const surgeOpacity = Math.sin(Math.PI * surgeProgress)
+
+        if (surgeRight > surgeLeft && surgeOpacity > 0) {
+          const surgeGradient = context.createLinearGradient(surgeLeft, 0, surgeRight, 0)
+          surgeGradient.addColorStop(0, 'transparent')
+          surgeGradient.addColorStop(0.5, frame.surge.color)
+          surgeGradient.addColorStop(1, 'transparent')
+          drawStroke(surgeGradient, frame.lineStrokeWidth + 1.2, surgeOpacity, surgeLeft, surgeRight - surgeLeft)
+        }
+      }
     })
 
     const firstPoint = frame.data.find((point) => {
@@ -388,7 +446,7 @@ function drawAnnotations(context: CanvasRenderingContext2D, frame: PredictionCha
 
 function drawMarkers(context: CanvasRenderingContext2D, frame: PredictionChartCanvasFrame) {
   const lastPoint = frame.data.at(-1)
-  if (!lastPoint || frame.cursor) {
+  if (!lastPoint || frame.cursor || frame.revealProgress < 0.999) {
     return
   }
 

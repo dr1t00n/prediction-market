@@ -1,4 +1,4 @@
-import { fireEvent, render, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, vi } from 'vitest'
 
 import { buildHistoryWithLatestPointOverride } from '@/app/[locale]/(platform)/event/[slug]/_utils/EventChartUtils'
@@ -15,9 +15,11 @@ const canvasCalls = {
   arc: vi.fn(),
   bezierCurveTo: vi.fn(),
   clearRect: vi.fn(),
+  createLinearGradient: vi.fn(() => ({ addColorStop: vi.fn() })),
   fillText: vi.fn(),
   lineTo: vi.fn(),
   moveTo: vi.fn(),
+  rect: vi.fn(),
 }
 
 function createCanvasContext(canvas: HTMLCanvasElement) {
@@ -29,12 +31,12 @@ function createCanvasContext(canvas: HTMLCanvasElement) {
     clearRect: canvasCalls.clearRect,
     clip: vi.fn(),
     closePath: vi.fn(),
-    createLinearGradient: vi.fn(() => ({ addColorStop: vi.fn() })),
+    createLinearGradient: canvasCalls.createLinearGradient,
     fill: vi.fn(),
     fillText: canvasCalls.fillText,
     lineTo: canvasCalls.lineTo,
     moveTo: canvasCalls.moveTo,
-    rect: vi.fn(),
+    rect: canvasCalls.rect,
     restore: vi.fn(),
     save: vi.fn(),
     setLineDash: vi.fn(),
@@ -169,6 +171,34 @@ describe('predictionChart', () => {
     })
     const snapshot = onCursorDataChange.mock.calls.at(-1)?.[0]
     expect(snapshot.values.price).toBeCloseTo(50, 3)
+    await waitFor(() => {
+      expect(canvasCalls.rect.mock.calls).toContainEqual([170, 26, 170, 186])
+    })
+  })
+
+  it('does not split the series color when cursor splitting is disabled', async () => {
+    const { getByRole } = render(
+      <PredictionChart data={data} series={series} width={400} height={220} showXAxis={false} disableCursorSplit />,
+    )
+    const canvas = getByRole('img', { name: 'Interactive prediction chart' })
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+      bottom: 220,
+      height: 220,
+      left: 0,
+      right: 400,
+      top: 0,
+      width: 400,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    })
+
+    await waitFor(() => expect(canvasCalls.clearRect).toHaveBeenCalled())
+    canvasCalls.rect.mockClear()
+    fireEvent.pointerMove(canvas, { clientX: 170, clientY: 100 })
+
+    await waitFor(() => expect(canvasCalls.clearRect.mock.calls.length).toBeGreaterThan(1))
+    expect(canvasCalls.rect.mock.calls).not.toContainEqual([170, 26, 170, 186])
   })
 
   it('keeps curved paths moving forward across uneven timestamps', async () => {
@@ -188,11 +218,12 @@ describe('predictionChart', () => {
         showXAxis={false}
         showYAxis={false}
         showHorizontalGrid={false}
+        disableResetAnimation
       />,
     )
 
     await waitFor(() => {
-      expect(canvasCalls.bezierCurveTo).toHaveBeenCalledTimes(3)
+      expect(canvasCalls.bezierCurveTo.mock.calls.length).toBeGreaterThanOrEqual(3)
     })
 
     let currentX = canvasCalls.moveTo.mock.calls[0]![0] as number
@@ -216,11 +247,12 @@ describe('predictionChart', () => {
         showHorizontalGrid={false}
         lineEndOffsetX={-34}
         markerOffsetX={-34}
+        disableResetAnimation
       />,
     )
 
     await waitFor(() => {
-      expect(canvasCalls.arc).toHaveBeenCalledTimes(2)
+      expect(canvasCalls.arc.mock.calls.length).toBeGreaterThanOrEqual(2)
     })
 
     const lineEndX = canvasCalls.bezierCurveTo.mock.calls[0]![4]
@@ -228,5 +260,44 @@ describe('predictionChart', () => {
     const markerCenterX = canvasCalls.arc.mock.calls[1]![0]
     expect(pulseCenterX).toBe(lineEndX)
     expect(markerCenterX).toBe(lineEndX)
+  })
+
+  it('reveals the chart before sweeping a highlight into the end marker', async () => {
+    const animationFrames: FrameRequestCallback[] = []
+    vi.spyOn(window.performance, 'now').mockReturnValue(1_000)
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      animationFrames.push(callback)
+      return animationFrames.length
+    })
+
+    render(
+      <PredictionChart
+        data={data}
+        series={series}
+        width={400}
+        height={220}
+        showXAxis={false}
+        showYAxis={false}
+        showHorizontalGrid={false}
+      />,
+    )
+
+    await waitFor(() => expect(animationFrames.length).toBeGreaterThan(0))
+    expect(canvasCalls.arc).not.toHaveBeenCalled()
+
+    canvasCalls.rect.mockClear()
+    act(() => animationFrames.shift()?.(1_700))
+    const partialRevealClip = canvasCalls.rect.mock.calls.find(
+      ([left, top, width, height]) => left === -4 && top === 26 && height === 186 && width > 8 && width < 396,
+    )
+    expect(partialRevealClip).toBeDefined()
+    expect(canvasCalls.arc).not.toHaveBeenCalled()
+
+    act(() => animationFrames.shift()?.(2_400))
+    expect(canvasCalls.arc).toHaveBeenCalled()
+
+    canvasCalls.createLinearGradient.mockClear()
+    act(() => animationFrames.shift()?.(2_780))
+    expect(canvasCalls.createLinearGradient).toHaveBeenCalled()
   })
 })

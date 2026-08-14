@@ -29,6 +29,10 @@ import {
 import { normalizeTicks, toDomainTimestamp } from '@/lib/prediction-chart-helpers'
 
 const defaultMargin = { top: 30, right: 60, bottom: 40, left: 0 }
+const FUTURE_LINE_COLOR_DARK = '#2C3F4F'
+const FUTURE_LINE_COLOR_LIGHT = '#99A6B5'
+const FUTURE_LINE_OPACITY_DARK = 0.55
+const FUTURE_LINE_OPACITY_LIGHT = 0.35
 const GRID_LINE_COLOR_DARK = '#51677A'
 const GRID_LINE_COLOR_LIGHT = '#8F9EAD'
 const GRID_LINE_OPACITY_DARK = 0.7
@@ -37,10 +41,16 @@ const MIN_Y_AXIS_TICKS = 3
 const PREFERRED_MAX_Y_AXIS_TICKS = 5
 const MAX_Y_AXIS_TICKS = 6
 const MARKER_PULSE_DURATION = 2600
+const INITIAL_REVEAL_DURATION = 1400
+const SURGE_DURATION = 760
 
 interface CursorState {
   point: DataPoint
   left: number
+}
+
+interface EntryAnimationState {
+  startedAt: number | null
 }
 
 interface TooltipEntry {
@@ -189,7 +199,7 @@ export default function PredictionChart({
   legendContent,
   showLegend = true,
   yAxis,
-  disableCursorSplit: _disableCursorSplit = false,
+  disableCursorSplit = false,
   disableResetAnimation: _disableResetAnimation = false,
   markerOuterRadius = 6,
   markerInnerRadius = 2.8,
@@ -215,9 +225,14 @@ export default function PredictionChart({
 }: PredictionChartProps): ReactElement {
   const series = useMemo(() => providedSeries ?? [], [providedSeries])
   const normalizedSignature = dataSignature ?? '__default__'
-  const { data, isClient } = usePredictionChartData(providedData, normalizedSignature, dataSyncMode)
+  const { data, isClient, lastDataUpdateTypeRef, previousDataRef } = usePredictionChartData(
+    providedData,
+    normalizedSignature,
+    dataSyncMode,
+  )
   const isDarkMode = useDarkMode()
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const entryAnimationRef = useRef<EntryAnimationState | null>(null)
   const [cursor, setCursor] = useState<CursorState | null>(null)
   const annotationScopeKey = `${normalizedSignature}:${showAnnotations ? '1' : '0'}`
   const [annotationHoverState, setAnnotationHoverState] = useState<{
@@ -400,7 +415,11 @@ export default function PredictionChart({
   const axisLabelOpacity = neutralAxisColors ? 1 : Math.min(1, defaultGridLineOpacity + 0.25)
 
   const createCanvasFrame = useCallback(
-    (markerPulseProgress: number): PredictionChartCanvasFrame => ({
+    (
+      markerPulseProgress: number,
+      revealProgress = 1,
+      surgeProgress: number | null = null,
+    ): PredictionChartCanvasFrame => ({
       width,
       height,
       margin: resolvedMargin,
@@ -445,6 +464,14 @@ export default function PredictionChart({
       markerPulseStyle,
       markerOffsetX,
       markerPulseProgress,
+      revealProgress,
+      surge:
+        surgeProgress == null
+          ? null
+          : {
+              color: isDarkMode ? 'rgba(255, 255, 255, 0.82)' : 'rgba(15, 23, 42, 0.55)',
+              progress: surgeProgress,
+            },
       cursor: cursor
         ? {
             x: cursor.left,
@@ -459,6 +486,12 @@ export default function PredictionChart({
             guideColor: cursorGuideColor,
           }
         : null,
+      cursorSplit: disableCursorSplit
+        ? null
+        : {
+            color: isDarkMode ? FUTURE_LINE_COLOR_DARK : FUTURE_LINE_COLOR_LIGHT,
+            opacity: isDarkMode ? FUTURE_LINE_OPACITY_DARK : FUTURE_LINE_OPACITY_LIGHT,
+          },
     }),
     [
       alignYAxisLabelsToChartEdge,
@@ -472,6 +505,7 @@ export default function PredictionChart({
       cursorGuideColor,
       cursorGuideTop,
       data,
+      disableCursorSplit,
       domainBounds.end,
       domainBounds.start,
       formatXAxisTick,
@@ -481,6 +515,7 @@ export default function PredictionChart({
       height,
       hideYAxisMinimumLabel,
       innerHeight,
+      isDarkMode,
       leadingGapStart,
       lineCurve,
       lineEndOffsetX,
@@ -518,10 +553,40 @@ export default function PredictionChart({
         return
       }
 
+      if (lastDataUpdateTypeRef.current === 'reset') {
+        entryAnimationRef.current =
+          _disableResetAnimation || data.length < 2 || series.length === 0 ? null : { startedAt: null }
+        lastDataUpdateTypeRef.current = 'none'
+      }
+      previousDataRef.current = data
+
       let frameId: number | null = null
       function draw(timestamp: number) {
+        const entryAnimation = entryAnimationRef.current
+        let revealProgress = 1
+        let surgeProgress: number | null = null
+
+        if (entryAnimation) {
+          entryAnimation.startedAt ??= timestamp
+          const elapsed = Math.max(0, timestamp - entryAnimation.startedAt)
+          const revealLinearProgress = Math.min(1, elapsed / INITIAL_REVEAL_DURATION)
+          revealProgress = 1 - (1 - revealLinearProgress) ** 3
+
+          if (revealLinearProgress >= 1) {
+            const resolvedSurgeProgress = Math.min(1, (elapsed - INITIAL_REVEAL_DURATION) / SURGE_DURATION)
+            surgeProgress = resolvedSurgeProgress
+            if (resolvedSurgeProgress >= 1) {
+              entryAnimationRef.current = null
+              surgeProgress = null
+            }
+          }
+        }
+
         const pulseProgress = (timestamp % MARKER_PULSE_DURATION) / MARKER_PULSE_DURATION
-        const didDraw = drawPredictionChartCanvas(canvas!, createCanvasFrame(pulseProgress))
+        const didDraw = drawPredictionChartCanvas(
+          canvas!,
+          createCanvasFrame(pulseProgress, revealProgress, surgeProgress),
+        )
         if (didDraw && data.length > 0 && series.length > 0 && !cursor) {
           frameId = window.requestAnimationFrame(draw)
         }
@@ -534,7 +599,16 @@ export default function PredictionChart({
         }
       }
     },
-    [createCanvasFrame, cursor, data.length, isClient, series.length],
+    [
+      _disableResetAnimation,
+      createCanvasFrame,
+      cursor,
+      data,
+      isClient,
+      lastDataUpdateTypeRef,
+      previousDataRef,
+      series.length,
+    ],
   )
 
   const emitCursorChange = useCallback(
@@ -564,6 +638,8 @@ export default function PredictionChart({
       if (!data.length || !series.length) {
         return
       }
+
+      entryAnimationRef.current = null
 
       const rect = event.currentTarget.getBoundingClientRect()
       const renderedX = rect.width > 0 ? ((event.clientX - rect.left) / rect.width) * width : 0
